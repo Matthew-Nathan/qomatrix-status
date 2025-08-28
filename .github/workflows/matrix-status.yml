@@ -2,11 +2,11 @@ name: Matrix Tor status
 
 on:
   schedule:
-    - cron: "*/9 * * * *"   # every 9 minutes, might modify later
+    - cron: "*/8 * * * *"   # every 8 minutes, yes, I hope so
   workflow_dispatch:          # allow manual runs
 
 permissions:
-  contents: read
+  contents: write
   pages: write
   id-token: write
 
@@ -45,7 +45,7 @@ jobs:
           MATRIX_ONION: ${{ secrets.MATRIX_ONION }}
         run: |
           set -e
-          mkdir -p public
+          mkdir -p public logs
           URL="${MATRIX_ONION%/}/_matrix/client/versions"
           echo "Probing $URL"
 
@@ -58,31 +58,51 @@ jobs:
           END=$(date +%s%3N || true)
 
           if [ -n "$START" ] && [ -n "$END" ]; then LATENCY_MS=$((END-START)); fi
-          BODY="${RESP% HTTPSTATUS:*}"
           CODE="${RESP##*HTTPSTATUS:}"
 
           if [ "$CODE" -ge 200 ] && [ "$CODE" -lt 500 ]; then STATUS="UP"; fi
           TS=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
 
+          # latest result, "fucked up"
           jq -n --arg status "$STATUS" --argjson code "${CODE:-0}" --arg timestamp "$TS" --argjson latency_ms "${LATENCY_MS:-0}" \
             '{status:$status, http_code:$code, checked_at:$timestamp, latency_ms:$latency_ms}' > public/status.json
 
-          # Simple badge page (optional)
-          cat > public/index.html <<'HTML'
-          <!doctype html><meta charset="utf-8"><title>QOMatrix Server Status</title>
-          <div id="badge" style="font:16px/1.4 system-ui; padding:12px; border-radius:10px; display:inline-block; box-shadow:0 1px 4px rgba(0,0,0,.1)"></div>
-          <script>
-          fetch('status.json', {cache:'no-store'}).then(r=>r.json()).then(d=>{
-            const el=document.getElementById('badge');
-            const up=d.status==='UP';
-            el.textContent = (up?'Online':'Offline') + ' – ' + d.checked_at + ' UTC';
-            el.style.background = up?'#e6ffed':'#ffe6e6';
-          }).catch(()=>{ document.getElementById('badge').textContent='Status unavailable'; });
-          </script>
-          HTML
+          # the raw log is here
+          echo "{\"status\":\"$STATUS\",\"http_code\":$CODE,\"checked_at\":\"$TS\",\"latency_ms\":$LATENCY_MS}" >> logs/raw.log
 
-          echo "status.json:"
-          cat public/status.json
+      - name: Aggregate history
+        run: |
+          mkdir -p public
+          tail -n 8000 logs/raw.log > logs/tmp.log  # ~45 days at 8m interval
+
+          node <<'JS'
+          const fs=require("fs");
+          if(!fs.existsSync("logs/tmp.log")) process.exit(0);
+          const data=fs.readFileSync("logs/tmp.log","utf8").trim().split("\n").map(JSON.parse);
+
+          // bucket into days → 2h blocks
+          const buckets={};
+          for(const d of data){
+            const date=new Date(d.checked_at);
+            const day=date.toISOString().slice(0,10);
+            const block=Math.floor(date.getUTCHours()/2); // 0..11
+            buckets[day] ??= Array.from({length:12},()=>[]);
+            buckets[day][block].push(d.status==="UP"?1:0);
+          }
+
+          const history=[];
+          for(const [day,blocks] of Object.entries(buckets).sort()){
+            history.push({
+              date:day,
+              blocks:blocks.map((arr,i)=>({
+                time:`${String(i*2).padStart(2,"0")}-${String(i*2+2).padStart(2,"0")}`,
+                status: arr.length ? (arr.reduce((a,b)=>a+b,0) > arr.length/2 ? "UP":"DOWN") : "NO DATA"
+              }))
+            });
+          }
+
+          fs.writeFileSync("public/history.json",JSON.stringify(history,null,2));
+          JS
 
       - name: Upload Pages artifact
         uses: actions/upload-pages-artifact@v3
@@ -97,7 +117,6 @@ jobs:
       id-token: write
     environment:
       name: github-pages
-      url: ${{ steps.deploy.outputs.page_url }}
     steps:
       - name: Deploy to GitHub Pages
         id: deploy
