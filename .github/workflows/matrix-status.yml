@@ -29,7 +29,7 @@ jobs:
         run: |
           mkdir -p tor-data
           PORT=$((9050 + RANDOM % 1000))  # randomize to avoid conflicts
-          echo "Using SOCKS port $PORT" > tor-port.txt
+          echo "$PORT" > tor-port.txt
           tor --SocksPort $PORT --DataDirectory ./tor-data --Log "notice file tor.log" &
           # Wait up to 60s for "Bootstrapped 100%"
           for i in {1..60}; do
