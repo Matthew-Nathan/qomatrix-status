@@ -1,0 +1,104 @@
+name: Matrix Tor status
+
+on:
+  schedule:
+    - cron: "*/10 * * * *"   # every 10 minutes, temporary!
+  workflow_dispatch:          # allow manual runs
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: "pages"
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Tor + tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y tor curl jq
+
+      - name: Start Tor and wait for bootstrap
+        run: |
+          mkdir -p tor-data
+          tor --SocksPort 9050 --DataDirectory ./tor-data --Log "notice file tor.log" &
+          # Wait up to 60s for "Bootstrapped 100%"
+          for i in {1..60}; do
+            if grep -q "Bootstrapped 100%" tor.log 2>/dev/null; then
+              echo "Tor bootstrapped"
+              break
+            fi
+            sleep 1
+          done
+          echo "Last 20 lines of tor.log:"
+          tail -n 20 tor.log || true
+
+      - name: Probe homeserver via Tor
+        env:
+          MATRIX_ONION: ${{ secrets.MATRIX_ONION }}
+        run: |
+          set -e
+          mkdir -p public
+          URL="${MATRIX_ONION%/}/_matrix/client/versions"
+          echo "Probing $URL"
+
+          STATUS="DOWN"
+          CODE=0
+          LATENCY_MS=0
+
+          START=$(date +%s%3N || true)
+          RESP=$(curl -sS --socks5-hostname 127.0.0.1:9050 --max-time 20 -w ' HTTPSTATUS:%{http_code}' "$URL" || true)
+          END=$(date +%s%3N || true)
+
+          if [ -n "$START" ] && [ -n "$END" ]; then LATENCY_MS=$((END-START)); fi
+          BODY="${RESP% HTTPSTATUS:*}"
+          CODE="${RESP##*HTTPSTATUS:}"
+
+          if [ "$CODE" -ge 200 ] && [ "$CODE" -lt 500 ]; then STATUS="UP"; fi
+          TS=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+
+          jq -n --arg status "$STATUS" --argjson code "${CODE:-0}" --arg timestamp "$TS" --argjson latency_ms "${LATENCY_MS:-0}" \
+            '{status:$status, http_code:$code, checked_at:$timestamp, latency_ms:$latency_ms}' > public/status.json
+
+          # Simple badge page (optional)
+          cat > public/index.html <<'HTML'
+          <!doctype html><meta charset="utf-8"><title>QOMatrix Server Status</title>
+          <div id="badge" style="font:16px/1.4 system-ui; padding:12px; border-radius:10px; display:inline-block; box-shadow:0 1px 4px rgba(0,0,0,.1)"></div>
+          <script>
+          fetch('status.json', {cache:'no-store'}).then(r=>r.json()).then(d=>{
+            const el=document.getElementById('badge');
+            const up=d.status==='UP';
+            el.textContent = (up?'Online':'Fucked up') + ' – ' + d.checked_at + ' UTC';
+            el.style.background = up?'#e6ffed':'#ffe6e6';
+          }).catch(()=>{ document.getElementById('badge').textContent='Status unavailable'; });
+          </script>
+          HTML
+
+          echo "status.json:"
+          cat public/status.json
+
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: public
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deploy.outputs.page_url }}
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deploy
+        uses: actions/deploy-pages@v4
