@@ -2,8 +2,8 @@ name: Matrix Tor status
 
 on:
   schedule:
-    - cron: "*/8 * * * *"   # every 8 minutes, hopefully.
-  workflow_dispatch:          # allow manual runs
+    - cron: "*/8 * * * *"   # every 8 minutes, hopefully
+  workflow_dispatch:
 
 permissions:
   contents: write
@@ -28,7 +28,9 @@ jobs:
       - name: Start Tor and wait for bootstrap
         run: |
           mkdir -p tor-data
-          tor --SocksPort 9050 --DataDirectory ./tor-data --Log "notice file tor.log" &
+          PORT=$((9050 + RANDOM % 1000))  # randomize to avoid conflicts
+          echo "Using SOCKS port $PORT" > tor-port.txt
+          tor --SocksPort $PORT --DataDirectory ./tor-data --Log "notice file tor.log" &
           # Wait up to 60s for "Bootstrapped 100%"
           for i in {1..60}; do
             if grep -q "Bootstrapped 100%" tor.log 2>/dev/null; then
@@ -52,30 +54,34 @@ jobs:
           STATUS="DOWN"
           CODE=0
           LATENCY_MS=0
+          PORT=$(cat tor-port.txt)
 
           START=$(date +%s%3N || true)
-          RESP=$(curl -sS --socks5-hostname 127.0.0.1:9050 --max-time 20 -w ' HTTPSTATUS:%{http_code}' "$URL" || true)
+          RESP=$(curl -sS --socks5-hostname 127.0.0.1:$PORT --max-time 20 -w ' HTTPSTATUS:%{http_code}' "$URL" || true)
           END=$(date +%s%3N || true)
 
           if [ -n "$START" ] && [ -n "$END" ]; then LATENCY_MS=$((END-START)); fi
           CODE="${RESP##*HTTPSTATUS:}"
+          # clean up code (strip leading zeros, default 0)
+          CODE_CLEAN=$(echo "${CODE:-0}" | sed 's/^0*//')
+          [ -z "$CODE_CLEAN" ] && CODE_CLEAN=0
 
-          if [ "$CODE" -ge 200 ] && [ "$CODE" -lt 500 ]; then STATUS="UP"; fi
+          if [ "$CODE_CLEAN" -ge 200 ] && [ "$CODE_CLEAN" -lt 500 ]; then STATUS="UP"; fi
           TS=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
 
           # latest result
-          jq -n --arg status "$STATUS" --argjson code "${CODE:-0}" --arg timestamp "$TS" --argjson latency_ms "${LATENCY_MS:-0}" \
+          jq -n --arg status "$STATUS" --argjson code "$CODE_CLEAN" --arg timestamp "$TS" --argjson latency_ms "$LATENCY_MS" \
             '{status:$status, http_code:$code, checked_at:$timestamp, latency_ms:$latency_ms}' > public/status.json
 
-          # append raw log line
-          echo "{\"status\":\"$STATUS\",\"http_code\":$CODE,\"checked_at\":\"$TS\",\"latency_ms\":$LATENCY_MS}" >> logs/raw.log
+          # raw log
+          echo "{\"status\":\"$STATUS\",\"http_code\":$CODE_CLEAN,\"checked_at\":\"$TS\",\"latency_ms\":$LATENCY_MS}" >> logs/raw.log
 
-      - name: Aggregate 14d history
+      - name: Aggregate history (14d)
         run: |
           mkdir -p public
-          # keep ~14 days worth of 8m checks (~2500 lines) in raw log
+          # keep ~14 days worth of 8m checks (~2500 lines)
           tail -n 3000 logs/raw.log > logs/tmp.log || true
-
+          
           node <<'JS'
           const fs = require("fs");
           if (!fs.existsSync("logs/tmp.log")) process.exit(0);
@@ -102,7 +108,7 @@ jobs:
             });
           }
 
-          // Keep only last 14 days!!
+          // Keep only last 14d
           const cutoff = new Date(Date.now() - 14*24*60*60*1000).toISOString().slice(0,10);
           const trimmed = history.filter(h => h.date >= cutoff);
 
