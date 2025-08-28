@@ -2,7 +2,7 @@ name: Matrix Tor status
 
 on:
   schedule:
-    - cron: "*/10 * * * *"   # every 10 minutes, temporary!
+    - cron: "*/9 * * * *"   # every 9 minutes, might modify later
   workflow_dispatch:          # allow manual runs
 
 permissions:
@@ -75,7 +75,7 @@ jobs:
           fetch('status.json', {cache:'no-store'}).then(r=>r.json()).then(d=>{
             const el=document.getElementById('badge');
             const up=d.status==='UP';
-            el.textContent = (up?'Online':'Fucked up') + ' – ' + d.checked_at + ' UTC';
+            el.textContent = (up?'Online':'Offline') + ' – ' + d.checked_at + ' UTC';
             el.style.background = up?'#e6ffed':'#ffe6e6';
           }).catch(()=>{ document.getElementById('badge').textContent='Status unavailable'; });
           </script>
