@@ -20,6 +20,13 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Download existing raw.log artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: raw-log
+          path: logs
+        continue-on-error: true
+
       - name: Install Tor + tools
         run: |
           sudo apt-get update
@@ -79,7 +86,7 @@ jobs:
       - name: Aggregate history
         run: |
           mkdir -p public
-          
+
           node <<'JS'
           const fs = require("fs");
 
@@ -120,6 +127,13 @@ jobs:
         uses: actions/upload-pages-artifact@v3
         with:
           path: public
+
+      - name: Upload raw.log artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: raw-log
+          path: logs/raw.log
+          retention-days: 15
 
   deploy:
     needs: build
