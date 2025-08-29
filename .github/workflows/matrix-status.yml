@@ -28,7 +28,7 @@ jobs:
       - name: Start Tor and wait for bootstrap
         run: |
           mkdir -p tor-data
-          PORT=$((9050 + RANDOM % 1000))  # randomize to avoid conflicts
+          PORT=$((9050 + RANDOM % 1000))
           echo "$PORT" > tor-port.txt
           tor --SocksPort $PORT --DataDirectory ./tor-data --Log "notice file tor.log" &
           # Wait up to 60s for "Bootstrapped 100%"
@@ -76,21 +76,26 @@ jobs:
           # raw log
           echo "{\"status\":\"$STATUS\",\"http_code\":$CODE_CLEAN,\"checked_at\":\"$TS\",\"latency_ms\":$LATENCY_MS}" >> logs/raw.log
 
-      - name: Aggregate history (14d)
+      - name: Aggregate history
         run: |
           mkdir -p public
-          # keep ~14 days worth of 8m checks (~2500 lines)
-          tail -n 3000 logs/raw.log > logs/tmp.log || true
           
           node <<'JS'
           const fs = require("fs");
-          if (!fs.existsSync("logs/tmp.log")) process.exit(0);
-          const lines = fs.readFileSync("logs/tmp.log","utf8").trim().split("\n").filter(Boolean);
-          const data = lines.map(JSON.parse);
+
+          // read the raw log (append-only, never truncated by shell)
+          if (!fs.existsSync("logs/raw.log")) process.exit(0);
+          const lines = fs.readFileSync("logs/raw.log","utf8").trim().split("\n").filter(Boolean);
+          const data = lines.map(l => {
+            try { return JSON.parse(l); } catch { return null; }
+          }).filter(Boolean);
+
+          const cutoff = new Date(Date.now() - 14*24*60*60*1000);
 
           const buckets = {};
           for (const d of data) {
             const date = new Date(d.checked_at);
+            if (date < cutoff) continue;
             const day = date.toISOString().slice(0,10);
             const block = Math.floor(date.getUTCHours()/2); // 0..11
             buckets[day] ??= Array.from({length:12},()=>[]);
@@ -108,11 +113,7 @@ jobs:
             });
           }
 
-          // Keep only last 14d
-          const cutoff = new Date(Date.now() - 14*24*60*60*1000).toISOString().slice(0,10);
-          const trimmed = history.filter(h => h.date >= cutoff);
-
-          fs.writeFileSync("public/history.json", JSON.stringify(trimmed,null,2));
+          fs.writeFileSync("public/history.json", JSON.stringify(history,null,2));
           JS
 
       - name: Upload Pages artifact
