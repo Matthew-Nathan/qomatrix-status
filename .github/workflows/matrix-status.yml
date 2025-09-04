@@ -1,8 +1,8 @@
-name: Matrix Tor Status
+name: Matrix Tor status
 
 on:
   schedule:
-    - cron: "*/8 * * * *"
+    - cron: "*/8 * * * *"  # every 8 minutes, hopefully
   workflow_dispatch:
 
 permissions:
@@ -10,40 +10,78 @@ permissions:
   pages: write
   id-token: write
 
+concurrency:
+  group: "pages"
+  cancel-in-progress: true
+
 jobs:
-  check-status:
+  build:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install Tor and curl
-        run: sudo apt-get update && sudo apt-get install -y tor curl
+      - name: Download existing raw.log artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: raw-log
+          path: logs
+        continue-on-error: true
 
-      - name: Start Tor
+      - name: Install Tor + tools
         run: |
-          tor --SocksPort 9050 --RunAsDaemon 1
-          # Wait for Tor bootstrap
-          for i in {1..30}; do
-            sleep 1
-            if grep -q "Bootstrapped 100%" /var/lib/tor/notice.log 2>/dev/null; then
+          sudo apt-get update
+          sudo apt-get install -y tor curl jq
+
+      - name: Start Tor and wait for bootstrap
+        run: |
+          mkdir -p tor-data
+          PORT=$((9050 + RANDOM % 1000))
+          echo "$PORT" > tor-port.txt
+          tor --SocksPort $PORT --DataDirectory ./tor-data --Log "notice file tor.log" &
+          # Wait up to 60s for "Bootstrapped 100%"
+          for i in {1..60}; do
+            if grep -q "Bootstrapped 100%" tor.log 2>/dev/null; then
+              echo "Tor bootstrapped"
               break
             fi
+            sleep 1
           done
+          echo "Last 20 lines of tor.log:"
+          tail -n 20 tor.log || true
 
-      - name: Check .onion status
+      - name: Probe homeserver via Tor
         env:
           MATRIX_ONION: ${{ secrets.MATRIX_ONION }}
         run: |
-          mkdir -p public
+          set -e
+          mkdir -p public logs
+          URL="${MATRIX_ONION%/}/_matrix/client/versions"
+          echo "Probing $URL"
+
           STATUS="DOWN"
           CODE=0
-          URL="${MATRIX_ONION%/}/_matrix/client/versions"
-          RESP=$(curl -sS --socks5-hostname 127.0.0.1:9050 --max-time 20 -w '%{http_code}' "$URL" || echo "000")
-          if [ "$RESP" = "200" ]; then
-            STATUS="UP"
-            CODE=200
-          fi
-          jq -n --arg status "$STATUS" --argjson code "$CODE" '{status:$status, http_code:$code}' > public/status.json
+          LATENCY_MS=0
+          PORT=$(cat tor-port.txt)
+
+          START=$(date +%s%3N || true)
+          RESP=$(curl -sS --socks5-hostname 127.0.0.1:$PORT --max-time 20 -w ' HTTPSTATUS:%{http_code}' "$URL" || true)
+          END=$(date +%s%3N || true)
+
+          if [ -n "$START" ] && [ -n "$END" ]; then LATENCY_MS=$((END-START)); fi
+          CODE="${RESP##*HTTPSTATUS:}"
+          # clean up code (strip leading zeros, default 0)
+          CODE_CLEAN=$(echo "${CODE:-0}" | sed 's/^0*//')
+          [ -z "$CODE_CLEAN" ] && CODE_CLEAN=0
+
+          if [ "$CODE_CLEAN" -ge 200 ] && [ "$CODE_CLEAN" -lt 500 ]; then STATUS="UP"; fi
+          TS=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+
+          # latest result
+          jq -n --arg status "$STATUS" --argjson code "$CODE_CLEAN" --arg timestamp "$TS" --argjson latency_ms "$LATENCY_MS" \
+            '{status:$status, http_code:$code, checked_at:$timestamp, latency_ms:$latency_ms}' > public/status.json
+
+          # raw log
+          echo "{\"status\":\"$STATUS\",\"http_code\":$CODE_CLEAN,\"checked_at\":\"$TS\",\"latency_ms\":$LATENCY_MS}" >> logs/raw.log
 
       - name: Upload Pages artifact
         uses: actions/upload-pages-artifact@v3
